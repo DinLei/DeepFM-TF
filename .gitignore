@@ -108,3 +108,8 @@ example/__pycache__/
 example/data/*.csv
 example/output/*.csv
 yellowfin.py
+
+# others
+example/data
+example/fig
+example/output

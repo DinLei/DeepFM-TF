@@ -6,13 +6,18 @@ Reference:
     Huifeng Guo, Ruiming Tang, Yunming Yey, Zhenguo Li, Xiuqiang He.
 """
 
+from time import time
+import datetime
+
+import os
 import numpy as np
 import tensorflow as tf
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.metrics import roc_auc_score
-from time import time
 from tensorflow.contrib.layers.python.layers import batch_norm as batch_norm
-from yellowfin import YFOptimizer
+
+
+# from yellowfin import YFOptimizer
 
 
 class DeepFM(BaseEstimator, TransformerMixin):
@@ -23,17 +28,18 @@ class DeepFM(BaseEstimator, TransformerMixin):
                  epoch=10, batch_size=256,
                  learning_rate=0.001, optimizer_type="adam",
                  batch_norm=0, batch_norm_decay=0.995,
-                 verbose=False, random_seed=2016,
+                 verbose=False, random_seed=2019, num_checkpoints=5,
                  use_fm=True, use_deep=True,
                  loss_type="logloss", eval_metric=roc_auc_score,
-                 l2_reg=0.0, greater_is_better=True):
+                 l2_reg=0.0, greater_is_better=False,
+                 model_dir=".", checkpoint_every=1):
         assert (use_fm or use_deep)
         assert loss_type in ["logloss", "mse"], \
             "loss_type can be either 'logloss' for classification task or 'mse' for regression task"
 
-        self.feature_size = feature_size        # denote as M, size of the feature dictionary
-        self.field_size = field_size            # denote as F, size of the feature fields
-        self.embedding_size = embedding_size    # denote as K, size of the feature embedding
+        self.feature_size = feature_size  # denote as M, size of the feature dictionary
+        self.field_size = field_size  # denote as F, size of the feature fields
+        self.embedding_size = embedding_size  # denote as K, size of the feature embedding
 
         self.dropout_fm = dropout_fm
         self.deep_layers = deep_layers
@@ -53,13 +59,23 @@ class DeepFM(BaseEstimator, TransformerMixin):
 
         self.verbose = verbose
         self.random_seed = random_seed
+        self.num_checkpoints = num_checkpoints
         self.loss_type = loss_type
         self.eval_metric = eval_metric
         self.greater_is_better = greater_is_better
         self.train_result, self.valid_result = [], []
 
-        self._init_graph()
+        self.model_dir = model_dir
+        self.checkpoint_every = checkpoint_every
 
+        if use_deep and use_fm:
+            self.model_type = "DeepFM"
+        elif use_deep:
+            self.model_type = "Deep"
+        elif use_fm:
+            self.model_type = "FM"
+
+        self._init_graph()
 
     def _init_graph(self):
         self.graph = tf.Graph()
@@ -68,9 +84,9 @@ class DeepFM(BaseEstimator, TransformerMixin):
             tf.set_random_seed(self.random_seed)
 
             self.feat_index = tf.placeholder(tf.int32, shape=[None, None],
-                                                 name="feat_index")  # None * F
+                                             name="feat_index")  # None * F
             self.feat_value = tf.placeholder(tf.float32, shape=[None, None],
-                                                 name="feat_value")  # None * F
+                                             name="feat_value")  # None * F
             self.label = tf.placeholder(tf.float32, shape=[None, 1], name="label")  # None * 1
             self.dropout_keep_fm = tf.placeholder(tf.float32, shape=[None], name="dropout_keep_fm")
             self.dropout_keep_deep = tf.placeholder(tf.float32, shape=[None], name="dropout_keep_deep")
@@ -78,82 +94,106 @@ class DeepFM(BaseEstimator, TransformerMixin):
 
             self.weights = self._initialize_weights()
 
-            # model
-            self.embeddings = tf.nn.embedding_lookup(self.weights["feature_embeddings"],
-                                                             self.feat_index)  # None * F * K
-            feat_value = tf.reshape(self.feat_value, shape=[-1, self.field_size, 1])
-            self.embeddings = tf.multiply(self.embeddings, feat_value)
+            with tf.name_scope("embedding_lookup"):
+                # model
+                self.embeddings = tf.nn.embedding_lookup(self.weights["feature_embeddings"],
+                                                         self.feat_index)  # None * F * K
+                feat_value = tf.reshape(self.feat_value, shape=[-1, self.field_size, 1])
+                self.embeddings = tf.multiply(self.embeddings, feat_value)
 
-            # ---------- first order term ----------
-            self.y_first_order = tf.nn.embedding_lookup(self.weights["feature_bias"], self.feat_index) # None * F * 1
-            self.y_first_order = tf.reduce_sum(tf.multiply(self.y_first_order, feat_value), 2)  # None * F
-            self.y_first_order = tf.nn.dropout(self.y_first_order, self.dropout_keep_fm[0]) # None * F
+            with tf.name_scope("first_order"):
+                # ---------- first order term   (w * x) ----------
+                self.y_first_order = tf.nn.embedding_lookup(self.weights["feature_bias"], self.feat_index)  # None * F * 1
+                self.y_first_order = tf.reduce_sum(tf.multiply(self.y_first_order, feat_value), 2)  # None * F
+                self.y_first_order = tf.nn.dropout(self.y_first_order, self.dropout_keep_fm[0])  # None * F
 
-            # ---------- second order term ---------------
-            # sum_square part
-            self.summed_features_emb = tf.reduce_sum(self.embeddings, 1)  # None * K
-            self.summed_features_emb_square = tf.square(self.summed_features_emb)  # None * K
+            with tf.name_scope("second_order"):
+                # ---------- second order term  (sigma·sigma(<vi, vj> * xi·xj)) ---------------
+                # sum_square part
+                self.summed_features_emb = tf.reduce_sum(self.embeddings, 1)  # None * K
+                self.summed_features_emb_square = tf.square(self.summed_features_emb)  # None * K
 
-            # square_sum part
-            self.squared_features_emb = tf.square(self.embeddings)
-            self.squared_sum_features_emb = tf.reduce_sum(self.squared_features_emb, 1)  # None * K
+                # square_sum part
+                self.squared_features_emb = tf.square(self.embeddings)
+                self.squared_sum_features_emb = tf.reduce_sum(self.squared_features_emb, 1)  # None * K
 
-            # second order
-            self.y_second_order = 0.5 * tf.subtract(self.summed_features_emb_square, self.squared_sum_features_emb)  # None * K
-            self.y_second_order = tf.nn.dropout(self.y_second_order, self.dropout_keep_fm[1])  # None * K
+                # second order
+                self.y_second_order = 0.5 * tf.subtract(self.summed_features_emb_square,
+                                                        self.squared_sum_features_emb)  # None * K
+                self.y_second_order = tf.nn.dropout(self.y_second_order, self.dropout_keep_fm[1])  # None * K
 
-            # ---------- Deep component ----------
-            self.y_deep = tf.reshape(self.embeddings, shape=[-1, self.field_size * self.embedding_size]) # None * (F*K)
-            self.y_deep = tf.nn.dropout(self.y_deep, self.dropout_keep_deep[0])
-            for i in range(0, len(self.deep_layers)):
-                self.y_deep = tf.add(tf.matmul(self.y_deep, self.weights["layer_%d" %i]), self.weights["bias_%d"%i]) # None * layer[i] * 1
-                if self.batch_norm:
-                    self.y_deep = self.batch_norm_layer(self.y_deep, train_phase=self.train_phase, scope_bn="bn_%d" %i) # None * layer[i] * 1
-                self.y_deep = self.deep_layers_activation(self.y_deep)
-                self.y_deep = tf.nn.dropout(self.y_deep, self.dropout_keep_deep[1+i]) # dropout at each Deep layer
+            with tf.name_scope("deep_component"):
+                # ---------- Deep component ----------
+                self.y_deep = tf.reshape(self.embeddings, shape=[-1, self.field_size * self.embedding_size])  # None * (F*K)
+                self.y_deep = tf.nn.dropout(self.y_deep, self.dropout_keep_deep[0])
+                for i in range(0, len(self.deep_layers)):
+                    self.y_deep = tf.add(tf.matmul(self.y_deep, self.weights["layer_%d" % i]),
+                                         self.weights["bias_%d" % i])  # None * layer[i] * 1
+                    if self.batch_norm:
+                        self.y_deep = self.batch_norm_layer(self.y_deep, train_phase=self.train_phase,
+                                                            scope_bn="bn_%d" % i)  # None * layer[i] * 1
+                    self.y_deep = self.deep_layers_activation(self.y_deep)
+                    self.y_deep = tf.nn.dropout(self.y_deep, self.dropout_keep_deep[1 + i])  # dropout at each Deep layer
 
-            # ---------- DeepFM ----------
-            if self.use_fm and self.use_deep:
-                concat_input = tf.concat([self.y_first_order, self.y_second_order, self.y_deep], axis=1)
-            elif self.use_fm:
-                concat_input = tf.concat([self.y_first_order, self.y_second_order], axis=1)
-            elif self.use_deep:
-                concat_input = self.y_deep
-            self.out = tf.add(tf.matmul(concat_input, self.weights["concat_projection"]), self.weights["concat_bias"])
+            with tf.name_scope("deep_fm"):
+                # ---------- DeepFM ----------
+                if self.use_fm and self.use_deep:
+                    concat_input = tf.concat([self.y_first_order, self.y_second_order, self.y_deep], axis=1)
+                elif self.use_fm:
+                    concat_input = tf.concat([self.y_first_order, self.y_second_order], axis=1)
+                elif self.use_deep:
+                    concat_input = self.y_deep
 
-            # loss
-            if self.loss_type == "logloss":
-                self.out = tf.nn.sigmoid(self.out)
-                self.loss = tf.losses.log_loss(self.label, self.out)
-            elif self.loss_type == "mse":
-                self.loss = tf.nn.l2_loss(tf.subtract(self.label, self.out))
-            # l2 regularization on weights
-            if self.l2_reg > 0:
-                self.loss += tf.contrib.layers.l2_regularizer(
-                    self.l2_reg)(self.weights["concat_projection"])
-                if self.use_deep:
-                    for i in range(len(self.deep_layers)):
-                        self.loss += tf.contrib.layers.l2_regularizer(
-                            self.l2_reg)(self.weights["layer_%d"%i])
+            with tf.name_scope("output"):
+                self.out = tf.add(tf.matmul(concat_input, self.weights["concat_projection"]), self.weights["concat_bias"])
+                if self.loss_type == "logloss":
+                    self.out = tf.nn.sigmoid(self.out)
 
+            with tf.name_scope("accuracy"):
+                if self.loss_type == "logloss":
+                    predictions = tf.round(self.out)
+                    correct_predictions = tf.equal(predictions, self.label)
+                    self.accuracy = tf.reduce_mean(tf.cast(correct_predictions, "float"), name="accuracy")
+                else:
+                    self.accuracy = tf.reduce_mean(tf.subtract(self.label, self.out))
+
+            with tf.name_scope("loss"):
+                # loss
+                if self.loss_type == "logloss":
+                    self.loss = tf.losses.log_loss(self.label, self.out)
+                elif self.loss_type == "mse":
+                    self.loss = tf.nn.l2_loss(tf.subtract(self.label, self.out))
+                # l2 regularization on weights
+                if self.l2_reg > 0:
+                    self.loss += tf.contrib.layers.l2_regularizer(
+                        self.l2_reg)(self.weights["concat_projection"])
+                    if self.use_deep:
+                        for i in range(len(self.deep_layers)):
+                            self.loss += tf.contrib.layers.l2_regularizer(
+                                self.l2_reg)(self.weights["layer_%d" % i])
+
+            # global step counter
+            self.global_step = tf.Variable(0, name="global_step", trainable=False)
             # optimizer
+            # 注意，这里保存一些中间训练情况到checkpoint，就不使用Optimizer(...).minimize(self.loss)
             if self.optimizer_type == "adam":
-                self.optimizer = tf.train.AdamOptimizer(learning_rate=self.learning_rate, beta1=0.9, beta2=0.999,
-                                                        epsilon=1e-8).minimize(self.loss)
+                train_op = tf.train.AdamOptimizer(
+                    learning_rate=self.learning_rate, beta1=0.9, beta2=0.999, epsilon=1e-8)
             elif self.optimizer_type == "adagrad":
-                self.optimizer = tf.train.AdagradOptimizer(learning_rate=self.learning_rate,
-                                                           initial_accumulator_value=1e-8).minimize(self.loss)
+                train_op = tf.train.AdagradOptimizer(
+                    learning_rate=self.learning_rate, initial_accumulator_value=1e-8)
             elif self.optimizer_type == "gd":
-                self.optimizer = tf.train.GradientDescentOptimizer(learning_rate=self.learning_rate).minimize(self.loss)
+                train_op = tf.train.GradientDescentOptimizer(learning_rate=self.learning_rate)
             elif self.optimizer_type == "momentum":
-                self.optimizer = tf.train.MomentumOptimizer(learning_rate=self.learning_rate, momentum=0.95).minimize(
-                    self.loss)
-            elif self.optimizer_type == "yellowfin":
-                self.optimizer = YFOptimizer(learning_rate=self.learning_rate, momentum=0.0).minimize(
-                    self.loss)
+                train_op = tf.train.MomentumOptimizer(learning_rate=self.learning_rate, momentum=0.95)
+            # elif self.optimizer_type == "yellowfin":
+            #     train_op = YFOptimizer(learning_rate=self.learning_rate, momentum=0.0).minimize(
+            #         self.loss)
+            self.grads_and_vars = train_op.compute_gradients(self.loss)
+            self.optimizer = train_op.apply_gradients(self.grads_and_vars, global_step=self.global_step)
 
             # init
-            self.saver = tf.train.Saver()
+            self._start_summary()
             init = tf.global_variables_initializer()
             self.sess = self._init_session()
             self.sess.run(init)
@@ -169,12 +209,10 @@ class DeepFM(BaseEstimator, TransformerMixin):
             if self.verbose > 0:
                 print("#params: %d" % total_parameters)
 
-
     def _init_session(self):
         config = tf.ConfigProto(device_count={"gpu": 0})
         config.gpu_options.allow_growth = True
         return tf.Session(config=config)
-
 
     def _initialize_weights(self):
         weights = dict()
@@ -193,11 +231,11 @@ class DeepFM(BaseEstimator, TransformerMixin):
         weights["layer_0"] = tf.Variable(
             np.random.normal(loc=0, scale=glorot, size=(input_size, self.deep_layers[0])), dtype=np.float32)
         weights["bias_0"] = tf.Variable(np.random.normal(loc=0, scale=glorot, size=(1, self.deep_layers[0])),
-                                                        dtype=np.float32)  # 1 * layers[0]
+                                        dtype=np.float32)  # 1 * layers[0]
         for i in range(1, num_layer):
-            glorot = np.sqrt(2.0 / (self.deep_layers[i-1] + self.deep_layers[i]))
+            glorot = np.sqrt(2.0 / (self.deep_layers[i - 1] + self.deep_layers[i]))
             weights["layer_%d" % i] = tf.Variable(
-                np.random.normal(loc=0, scale=glorot, size=(self.deep_layers[i-1], self.deep_layers[i])),
+                np.random.normal(loc=0, scale=glorot, size=(self.deep_layers[i - 1], self.deep_layers[i])),
                 dtype=np.float32)  # layers[i-1] * layers[i]
             weights["bias_%d" % i] = tf.Variable(
                 np.random.normal(loc=0, scale=glorot, size=(1, self.deep_layers[i])),
@@ -212,12 +250,49 @@ class DeepFM(BaseEstimator, TransformerMixin):
             input_size = self.deep_layers[-1]
         glorot = np.sqrt(2.0 / (input_size + 1))
         weights["concat_projection"] = tf.Variable(
-                        np.random.normal(loc=0, scale=glorot, size=(input_size, 1)),
-                        dtype=np.float32)  # layers[i-1]*layers[i]
+            np.random.normal(loc=0, scale=glorot, size=(input_size, 1)),
+            dtype=np.float32)  # layers[i-1]*layers[i]
         weights["concat_bias"] = tf.Variable(tf.constant(0.01), dtype=np.float32)
 
         return weights
 
+    def _start_summary(self):
+        # Keep track of gradient values and sparsity (optional)
+        grad_summaries = []
+        for g, v in self.grads_and_vars:
+            if g is not None:
+                grad_hist_summary = tf.summary.histogram("{}/grad/hist".format(v.name), g)
+                sparsity_summary = tf.summary.scalar("{}/grad/sparsity".format(v.name), tf.nn.zero_fraction(g))
+                grad_summaries.append(grad_hist_summary)
+                grad_summaries.append(sparsity_summary)
+        grad_summaries_merged = tf.summary.merge(grad_summaries)
+
+        # Output directory for models and summaries
+        # timestamp = str(int(time()))
+        # out_dir = os.path.abspath(os.path.join(self.model_dir, "runs", timestamp))
+        out_dir = self.model_dir
+        print("Writing all tensorflow training files to {}\n".format(out_dir))
+
+        # Summaries for loss and accuracy
+        loss_summary = tf.summary.scalar("loss", self.loss)
+        accuracy = tf.summary.scalar("accuracy", self.accuracy)
+
+        # Train Summaries
+        self.train_summary_op = tf.summary.merge([loss_summary, accuracy, grad_summaries_merged])
+        train_summary_dir = os.path.join(out_dir, "summaries", "train")
+        self.train_summary_writer = tf.summary.FileWriter(train_summary_dir, self.graph)
+
+        # Dev summaries
+        self.dev_summary_op = tf.summary.merge([loss_summary, accuracy])
+        dev_summary_dir = os.path.join(out_dir, "summaries", "dev")
+        self.dev_summary_writer = tf.summary.FileWriter(dev_summary_dir, self.graph)
+
+        # Checkpoint directory. Tensorflow assumes this directory already exists so we need to create it
+        checkpoint_dir = os.path.abspath(os.path.join(out_dir, "checkpoints"))
+        self.checkpoint_prefix = os.path.join(checkpoint_dir, "model")
+        if not os.path.exists(checkpoint_dir):
+            os.makedirs(checkpoint_dir)
+        self.saver = tf.train.Saver(tf.global_variables(), max_to_keep=self.num_checkpoints)
 
     def batch_norm_layer(self, x, train_phase, scope_bn):
         bn_train = batch_norm(x, decay=self.batch_norm_decay, center=True, scale=True, updates_collections=None,
@@ -227,13 +302,11 @@ class DeepFM(BaseEstimator, TransformerMixin):
         z = tf.cond(train_phase, lambda: bn_train, lambda: bn_inference)
         return z
 
-
     def get_batch(self, Xi, Xv, y, batch_size, index):
         start = index * batch_size
-        end = (index+1) * batch_size
+        end = (index + 1) * batch_size
         end = end if end < len(y) else len(y)
         return Xi[start:end], Xv[start:end], [[y_] for y_ in y[start:end]]
-
 
     # shuffle three lists simutaneously
     def shuffle_in_unison_scary(self, a, b, c):
@@ -244,17 +317,28 @@ class DeepFM(BaseEstimator, TransformerMixin):
         np.random.set_state(rng_state)
         np.random.shuffle(c)
 
-
-    def fit_on_batch(self, Xi, Xv, y):
+    def fit_on_batch(self, Xi, Xv, y, train_phase=True):
         feed_dict = {self.feat_index: Xi,
                      self.feat_value: Xv,
                      self.label: y,
                      self.dropout_keep_fm: self.dropout_fm,
                      self.dropout_keep_deep: self.dropout_deep,
-                     self.train_phase: True}
-        loss, opt = self.sess.run((self.loss, self.optimizer), feed_dict=feed_dict)
-        return loss
-
+                     self.train_phase: train_phase}
+        if train_phase:
+            _, step, summaries, loss, acc = self.sess.run(
+                (self.optimizer, self.global_step, self.train_summary_op, self.loss, self.accuracy),
+                feed_dict=feed_dict
+            )
+            self.train_summary_writer.add_summary(summaries, step)
+        else:
+            _, step, summaries, loss, acc = self.sess.run(
+                (self.optimizer, self.global_step, self.dev_summary_op, self.loss, self.accuracy),
+                feed_dict=feed_dict
+            )
+            self.dev_summary_writer.add_summary(summaries, step)
+        time_str = datetime.datetime.now().isoformat()
+        print("{}: step {}, loss {:g}, acc {:g}".format(time_str, step, loss, acc))
+        return True
 
     def fit(self, Xi_train, Xv_train, y_train,
             Xi_valid=None, Xv_valid=None, y_valid=None,
@@ -264,7 +348,8 @@ class DeepFM(BaseEstimator, TransformerMixin):
                          indi_j is the feature index of feature field j of sample i in the training set
         :param Xv_train: [[val1_1, val1_2, ...], [val2_1, val2_2, ...], ..., [vali_1, vali_2, ..., vali_j, ...], ...]
                          vali_j is the feature value of feature field j of sample i in the training set
-                         vali_j can be either binary (1/0, for binary/categorical features) or float (e.g., 10.24, for numerical features)
+                         vali_j can be either binary (1/0, for binary/categorical features) or float
+                         (e.g., 10.24, for numerical features)
         :param y_train: label of each sample in the training set
         :param Xi_valid: list of list of feature indices of each sample in the validation set
         :param Xv_valid: list of list of feature values of each sample in the validation set
@@ -290,12 +375,17 @@ class DeepFM(BaseEstimator, TransformerMixin):
                 self.valid_result.append(valid_result)
             if self.verbose > 0 and epoch % self.verbose == 0:
                 if has_valid:
-                    print("[%d] train-result=%.4f, valid-result=%.4f [%.1f s]"
-                        % (epoch + 1, train_result, valid_result, time() - t1))
+                    print("| %s | [%d] | train-result=%.4f, valid-result=%.4f | time_gap=[%.1f s]"
+                          % (self.model_type, epoch + 1, train_result, valid_result, time() - t1))
                 else:
-                    print("[%d] train-result=%.4f [%.1f s]"
-                        % (epoch + 1, train_result, time() - t1))
+                    print("| %s | [%d] | train-result=%.4f | time_gap=[%.1f s]"
+                          % (self.model_type, epoch + 1, train_result, time() - t1))
+
+            curr_step = tf.train.global_step(self.sess, self.global_step)
+            if curr_step % self.checkpoint_every == 0 or epoch == (self.epoch-1):
+                self.saver.save(self.sess, self.checkpoint_prefix, global_step=curr_step)
             if has_valid and early_stopping and self.training_termination(self.valid_result):
+                self.saver.save(self.sess, self.checkpoint_prefix, global_step=curr_step)
                 break
 
         # fit a few more epoch on train+valid until result reaches the best_train_score
@@ -313,33 +403,26 @@ class DeepFM(BaseEstimator, TransformerMixin):
                 self.shuffle_in_unison_scary(Xi_train, Xv_train, y_train)
                 total_batch = int(len(y_train) / self.batch_size)
                 for i in range(total_batch):
-                    Xi_batch, Xv_batch, y_batch = self.get_batch(Xi_train, Xv_train, y_train,
-                                                                self.batch_size, i)
+                    Xi_batch, Xv_batch, y_batch = self.get_batch(
+                        Xi_train, Xv_train, y_train, self.batch_size, i)
                     self.fit_on_batch(Xi_batch, Xv_batch, y_batch)
                 # check
                 train_result = self.evaluate(Xi_train, Xv_train, y_train)
                 if abs(train_result - best_train_score) < 0.001 or \
-                    (self.greater_is_better and train_result > best_train_score) or \
-                    ((not self.greater_is_better) and train_result < best_train_score):
+                        (self.greater_is_better and train_result > best_train_score) or \
+                        ((not self.greater_is_better) and train_result < best_train_score):
+                    self.saver.save(self.sess, self.checkpoint_prefix, global_step=None)
                     break
-
 
     def training_termination(self, valid_result):
         if len(valid_result) > 5:
             if self.greater_is_better:
-                if valid_result[-1] < valid_result[-2] and \
-                    valid_result[-2] < valid_result[-3] and \
-                    valid_result[-3] < valid_result[-4] and \
-                    valid_result[-4] < valid_result[-5]:
+                if valid_result[-1] < valid_result[-2] < valid_result[-3] < valid_result[-4] < valid_result[-5]:
                     return True
             else:
-                if valid_result[-1] > valid_result[-2] and \
-                    valid_result[-2] > valid_result[-3] and \
-                    valid_result[-3] > valid_result[-4] and \
-                    valid_result[-4] > valid_result[-5]:
+                if valid_result[-1] > valid_result[-2] > valid_result[-3] > valid_result[-4] > valid_result[-5]:
                     return True
         return False
-
 
     def predict(self, Xi, Xv):
         """
@@ -372,7 +455,6 @@ class DeepFM(BaseEstimator, TransformerMixin):
 
         return y_pred
 
-
     def evaluate(self, Xi, Xv, y):
         """
         :param Xi: list of list of feature indices of each sample in the dataset
@@ -382,4 +464,3 @@ class DeepFM(BaseEstimator, TransformerMixin):
         """
         y_pred = self.predict(Xi, Xv)
         return self.eval_metric(y, y_pred)
-
