@@ -338,7 +338,7 @@ class DeepFM(BaseEstimator, TransformerMixin):
             self.dev_summary_writer.add_summary(summaries, step)
         time_str = datetime.datetime.now().isoformat()
         print("{}: step {}, loss {:g}, acc {:g}".format(time_str, step, loss, acc))
-        return True
+        return step, loss, acc
 
     def fit(self, Xi_train, Xv_train, y_train,
             Xi_valid=None, Xv_valid=None, y_valid=None,
@@ -365,7 +365,10 @@ class DeepFM(BaseEstimator, TransformerMixin):
             total_batch = int(len(y_train) / self.batch_size)
             for i in range(total_batch):
                 Xi_batch, Xv_batch, y_batch = self.get_batch(Xi_train, Xv_train, y_train, self.batch_size, i)
-                self.fit_on_batch(Xi_batch, Xv_batch, y_batch)
+                step, loss, acc = self.fit_on_batch(Xi_batch, Xv_batch, y_batch)
+
+                if step % self.checkpoint_every == 0 or epoch == (self.epoch - 1):
+                    self.saver.save(self.sess, self.checkpoint_prefix, global_step=step)
 
             # evaluate training and validation datasets
             train_result = self.evaluate(Xi_train, Xv_train, y_train)
@@ -381,11 +384,8 @@ class DeepFM(BaseEstimator, TransformerMixin):
                     print("| %s | [%d] | train-result=%.4f | time_gap=[%.1f s]"
                           % (self.model_type, epoch + 1, train_result, time() - t1))
 
-            curr_step = tf.train.global_step(self.sess, self.global_step)
-            if curr_step % self.checkpoint_every == 0 or epoch == (self.epoch-1):
-                self.saver.save(self.sess, self.checkpoint_prefix, global_step=curr_step)
             if has_valid and early_stopping and self.training_termination(self.valid_result):
-                self.saver.save(self.sess, self.checkpoint_prefix, global_step=curr_step)
+                self.saver.save(self.sess, self.checkpoint_prefix, global_step=None)
                 break
 
         # fit a few more epoch on train+valid until result reaches the best_train_score

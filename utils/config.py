@@ -7,7 +7,7 @@ SUB_DIR = "./output"
 
 NUM_CK_POINTS = 10
 
-# 每2个step就保存一次checkpoint
+# 每5个step就保存一次checkpoint
 CHECKPOINT_EVERY = 5
 
 
